@@ -1,10 +1,23 @@
 {
-  "name": "git-commit-categories",
+  "name": "@honga/repo",
   "version": "1.0.0",
-  "description": "A script to analyze and categorize git commit messages.",
-  "main": "commit-analyzer.ts",
+  "description": "AI-powered Git commit analyzer and rewriter with conventional commit standards support",
+  "main": "dist/commit-analyzer.js",
+  "bin": {
+    "git-commit-analyzer": "dist/commit-analyzer.js",
+    "gca": "dist/commit-analyzer.js"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "CONVENTIONAL_COMMITS_GUIDE.md",
+    "LICENSE",
+    ".env.example"
+  ],
   "scripts": {
+    "build": "tsc",
     "start": "ts-node commit-analyzer.ts ../cline",
+    "prepublishOnly": "npm run build",
     "test": "echo \"Error: no test specified\" && exit 1",
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{ts,js,json,md}\"",
@@ -14,14 +27,27 @@
   "keywords": [
     "git",
     "commit",
+    "conventional-commits",
     "analysis",
-    "openai"
+    "rewrite",
+    "ai",
+    "openrouter",
+    "cli",
+    "typescript",
+    "commit-analyzer"
   ],
-  "author": "",
+  "author": "honga",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/honga/git-commit-categories.git"
+  },
+  "homepage": "https://github.com/honga/git-commit-categories#readme",
+  "bugs": {
+    "url": "https://github.com/honga/git-commit-categories/issues"
+  },
   "license": "ISC",
   "dependencies": {
     "dotenv": "^16.5.0",
-    "p-limit": "^6.2.0",
     "tiktoken": "^1.0.21"
   },
   "devDependencies": {

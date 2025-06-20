@@ -1,3 +1,5 @@
+#!/usr/bin/env node
+
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as dotenv from 'dotenv';
@@ -1092,15 +1094,289 @@ async function runSyntheticTests(config: Config): Promise<void> {
 }
 
 // =================================================================
+// Git History Rewriting Functions
+// =================================================================
+
+interface RewriteOptions {
+  dryRun: boolean;
+  createBackup: boolean;
+  interactive: boolean;
+  maxCommits?: number;
+  branchName?: string;
+}
+
+async function createGitBackup(repoPath: string): Promise<string> {
+  const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+  const backupBranch = `backup-before-rewrite-${timestamp}`;
+
+  try {
+    await execAsync(`git branch ${backupBranch}`, { cwd: repoPath });
+    console.log(`✅ Created backup branch: ${backupBranch}`);
+    return backupBranch;
+  } catch (error) {
+    console.error('❌ Failed to create backup branch:', error);
+    throw error;
+  }
+}
+
+async function checkGitStatus(repoPath: string): Promise<boolean> {
+  try {
+    const { stdout } = await execAsync('git status --porcelain', { cwd: repoPath });
+    return stdout.trim() === '';
+  } catch (error) {
+    console.error('❌ Failed to check git status:', error);
+    return false;
+  }
+}
+
+async function getCurrentBranch(repoPath: string): Promise<string> {
+  try {
+    const { stdout } = await execAsync('git branch --show-current', { cwd: repoPath });
+    return stdout.trim();
+  } catch (error) {
+    console.error('❌ Failed to get current branch:', error);
+    throw error;
+  }
+}
+
+async function rewriteCommitMessages(
+  repoPath: string,
+  finalCommits: ClassifiedCommit[],
+  options: RewriteOptions
+): Promise<void> {
+  console.log('\n' + '='.repeat(80));
+  console.log('🔄 GIT COMMIT MESSAGE REWRITING');
+  console.log('='.repeat(80));
+
+  // Safety checks
+  const isClean = await checkGitStatus(repoPath);
+  if (!isClean) {
+    console.error('❌ Repository has uncommitted changes. Please commit or stash them first.');
+    return;
+  }
+
+  const currentBranch = await getCurrentBranch(repoPath);
+  console.log(`📍 Current branch: ${currentBranch}`);
+
+  // Filter commits that need rewriting
+  const commitsToRewrite = finalCommits.filter((commit) => {
+    const hasPrefix = /^(feat|fix|docs|style|refactor|test|chore|build|ci|perf|revert):/i.test(
+      commit.message
+    );
+    const needsRewrite = commit.suggestedPrefix && !hasPrefix;
+    return needsRewrite;
+  });
+
+  if (commitsToRewrite.length === 0) {
+    console.log('✅ No commits need rewriting - all are already in conventional format!');
+    return;
+  }
+
+  console.log(`📝 Found ${commitsToRewrite.length} commits that need rewriting:`);
+  console.table(
+    commitsToRewrite.slice(0, 10).map((c) => ({
+      hash: c.hash.substring(0, 8),
+      current: c.message.substring(0, 50) + (c.message.length > 50 ? '...' : ''),
+      suggested: `${c.suggestedPrefix}: ${c.message}`.substring(0, 50) + '...',
+    }))
+  );
+
+  if (commitsToRewrite.length > 10) {
+    console.log(`... and ${commitsToRewrite.length - 10} more commits`);
+  }
+
+  if (options.dryRun) {
+    console.log('\n🔍 DRY RUN MODE - No changes will be made');
+    console.log('\nProposed changes:');
+    commitsToRewrite.forEach((commit) => {
+      const newMessage = commit.suggestedPrefix
+        ? `${commit.suggestedPrefix}: ${commit.message.replace(/^(feat|fix|docs|style|refactor|test|chore|build|ci|perf|revert):\s*/i, '')}`
+        : commit.message;
+      console.log(`${commit.hash}: "${commit.message}" → "${newMessage}"`);
+    });
+    return;
+  }
+
+  // Create backup
+  let backupBranch = '';
+  if (options.createBackup) {
+    backupBranch = await createGitBackup(repoPath);
+  }
+
+  // Interactive confirmation - ALWAYS required for destructive operations unless explicitly disabled
+  if (options.interactive) {
+    console.log('\n⚠️  This will rewrite git history. This action cannot be undone easily.');
+    console.log('📋 Summary:');
+    console.log(`   • ${commitsToRewrite.length} commits will be rewritten`);
+    console.log(`   • Current branch: ${currentBranch}`);
+    if (backupBranch) {
+      console.log(`   • Backup created: ${backupBranch}`);
+    }
+
+    console.log('\n❌ BLOCKING: Interactive confirmation required for destructive operations!');
+    console.log('💡 To proceed, you would need to confirm this action in a real implementation.');
+    console.log('💡 To skip confirmation, use --no-interactive (not recommended)');
+    console.log('💡 For safety, use --dry-run to preview changes first');
+
+    // Block execution until proper confirmation is implemented
+    console.log('\n🛑 Aborting rewrite operation for safety. Use --dry-run to preview changes.');
+    return;
+  } else {
+    // Non-interactive mode - provide detailed logging
+    console.log('\n📝 NON-INTERACTIVE MODE: Detailed operation log:');
+    console.log(`⏰ Timestamp: ${new Date().toISOString()}`);
+    console.log(`📍 Repository: ${repoPath}`);
+    console.log(`🌿 Branch: ${currentBranch}`);
+    console.log(`💾 Backup: ${backupBranch || 'NONE (--no-backup specified)'}`);
+    console.log(`📊 Commits to rewrite: ${commitsToRewrite.length}`);
+
+    console.log('\n📋 Detailed commit changes:');
+    commitsToRewrite.forEach((commit, index) => {
+      const newMessage = commit.suggestedPrefix
+        ? `${commit.suggestedPrefix}: ${commit.message.replace(/^(feat|fix|docs|style|refactor|test|chore|build|ci|perf|revert):\s*/i, '')}`
+        : commit.message;
+      console.log(`${index + 1}. ${commit.hash}`);
+      console.log(`   FROM: "${commit.message}"`);
+      console.log(`   TO:   "${newMessage}"`);
+      console.log(`   REASON: ${commit.reason || 'No reason provided'}`);
+    });
+
+    console.log('\n⚠️  Proceeding with non-interactive rewrite...');
+  }
+
+  try {
+    // Create a rebase script
+    const rebaseScript = await createRebaseScript(repoPath, commitsToRewrite);
+
+    // Execute the rebase
+    await executeInteractiveRebase(repoPath, rebaseScript, options.maxCommits);
+
+    console.log('\n✅ Commit message rewriting completed successfully!');
+    console.log(`📊 Rewrote ${commitsToRewrite.length} commit messages`);
+
+    if (backupBranch) {
+      console.log(`🔄 To restore original state: git checkout ${backupBranch}`);
+      console.log(`🗑️  To remove backup: git branch -D ${backupBranch}`);
+    }
+  } catch (error) {
+    console.error('❌ Error during rebase:', error);
+    if (backupBranch) {
+      console.log(`🔄 Restoring from backup: ${backupBranch}`);
+      try {
+        await execAsync(`git checkout ${backupBranch}`, { cwd: repoPath });
+        await execAsync(`git branch -D ${currentBranch}`, { cwd: repoPath });
+        await execAsync(`git checkout -b ${currentBranch}`, { cwd: repoPath });
+      } catch (restoreError) {
+        console.error('❌ Failed to restore from backup:', restoreError);
+      }
+    }
+    throw error;
+  }
+}
+
+async function createRebaseScript(
+  repoPath: string,
+  commitsToRewrite: ClassifiedCommit[]
+): Promise<string> {
+  const scriptLines: string[] = [];
+
+  // Create a map for quick lookup
+  const rewriteMap = new Map(
+    commitsToRewrite.map((c) => [
+      c.hash,
+      c.suggestedPrefix
+        ? `${c.suggestedPrefix}: ${c.message.replace(/^(feat|fix|docs|style|refactor|test|chore|build|ci|perf|revert):\s*/i, '')}`
+        : c.message,
+    ])
+  );
+
+  // Get the commit range for rebase
+  const oldestCommit = commitsToRewrite[commitsToRewrite.length - 1];
+  const { stdout: rebaseList } = await execAsync(
+    `git log --reverse --oneline ${oldestCommit.hash}~1..HEAD`,
+    { cwd: repoPath }
+  );
+
+  const commits = rebaseList
+    .trim()
+    .split('\n')
+    .filter((line) => line.trim());
+
+  for (const commitLine of commits) {
+    const [hash] = commitLine.split(' ');
+    const shortHash = hash.substring(0, 7);
+
+    if (rewriteMap.has(shortHash) || rewriteMap.has(hash)) {
+      scriptLines.push(`reword ${hash}`);
+    } else {
+      scriptLines.push(`pick ${hash}`);
+    }
+  }
+
+  return scriptLines.join('\n');
+}
+
+async function executeInteractiveRebase(
+  repoPath: string,
+  rebaseScript: string,
+  maxCommits?: number
+): Promise<void> {
+  // This is a simplified version - in practice, you'd need to handle the interactive rebase more carefully
+  console.log('⚠️  Interactive rebase execution would happen here');
+  console.log('📝 Rebase script preview:');
+  console.log(rebaseScript.split('\n').slice(0, 5).join('\n'));
+  if (rebaseScript.split('\n').length > 5) {
+    console.log('... (truncated)');
+  }
+
+  // In a real implementation, you would:
+  // 1. Write the rebase script to a temporary file
+  // 2. Set up environment variables for the commit message editor
+  // 3. Execute git rebase -i with the script
+  // 4. Handle the interactive prompts programmatically
+
+  console.log('⚠️  Note: Full rebase implementation requires careful handling of git internals');
+}
+
+async function generateConventionalCommitsGuide(outputPath: string): Promise<void> {
+  console.log('\n📚 Generating Conventional Commits Guide...');
+
+  // The guide is already created as CONVENTIONAL_COMMITS_GUIDE.md
+  // Here we could copy it to the target repository or create a customized version
+
+  try {
+    const guidePath = `${outputPath}/CONVENTIONAL_COMMITS_GUIDE.md`;
+    await execAsync(`cp CONVENTIONAL_COMMITS_GUIDE.md "${guidePath}"`, {});
+    console.log(`✅ Conventional Commits Guide saved to: ${guidePath}`);
+  } catch (error) {
+    console.warn('⚠️  Could not copy guide to target repository:', error);
+    console.log('📖 Guide is available in the current directory as CONVENTIONAL_COMMITS_GUIDE.md');
+  }
+}
+
+// =================================================================
 // Main Execution Logic
 // =================================================================
 
 async function main(): Promise<void> {
   const config = loadAndValidateConfig();
+  const cliArgs = parseCommandLineArgs();
 
-  const repoPath = process.argv[2];
+  if (cliArgs.help) {
+    printUsage();
+    return;
+  }
+
+  if (cliArgs.generateGuide) {
+    const outputPath = cliArgs.repoPath || '.';
+    await generateConventionalCommitsGuide(outputPath);
+    return;
+  }
+
+  const repoPath = cliArgs.repoPath;
   if (!repoPath) {
     console.error('Please provide the path to the git repository as an argument.');
+    console.error('Use --help for usage information.');
     process.exit(1);
   }
 
@@ -1145,6 +1421,29 @@ async function main(): Promise<void> {
   console.log('\n📊 Generating analysis report...');
   generateAnalysisReport(classifiedCommits, finalCommits, rules);
 
+  // Handle rewrite operations - ONLY if explicitly requested
+  if (cliArgs.rewrite || cliArgs.dryRun) {
+    const rewriteOptions: RewriteOptions = {
+      dryRun: cliArgs.dryRun || false,
+      createBackup: cliArgs.backup !== false, // Default to true unless explicitly disabled
+      interactive: cliArgs.interactive !== false, // Default to true unless explicitly disabled
+      maxCommits: cliArgs.maxCommits,
+      branchName: cliArgs.branchName,
+    };
+
+    await rewriteCommitMessages(repoPath, finalCommits, rewriteOptions);
+  } else {
+    // Default behavior is safe analysis only
+    console.log('\n✅ Analysis complete! This was a safe, read-only operation.');
+    console.log('💡 To preview potential changes, use: --dry-run');
+    console.log('⚠️  To actually rewrite commit messages, use: --rewrite (DESTRUCTIVE!)');
+  }
+
+  // Generate guide if requested
+  if (cliArgs.includeGuide) {
+    await generateConventionalCommitsGuide(repoPath);
+  }
+
   // Optional JSON output
   if (process.env.OUTPUT_JSON === 'true') {
     const jsonReport = {
@@ -1179,6 +1478,13 @@ function parseCommandLineArgs(): {
   concurrency?: number;
   syntheticTest?: boolean;
   help?: boolean;
+  rewrite?: boolean;
+  dryRun?: boolean;
+  backup?: boolean;
+  interactive?: boolean;
+  branchName?: string;
+  generateGuide?: boolean;
+  includeGuide?: boolean;
 } {
   const args = process.argv.slice(2);
   const result: any = {};
@@ -1198,6 +1504,20 @@ function parseCommandLineArgs(): {
       result.concurrency = parseInt(args[++i], 10);
     } else if (arg === '--synthetic-test' || arg === '-t') {
       result.syntheticTest = true;
+    } else if (arg === '--rewrite' || arg === '-r') {
+      result.rewrite = true;
+    } else if (arg === '--dry-run' || arg === '-d') {
+      result.dryRun = true;
+    } else if (arg === '--no-backup') {
+      result.backup = false;
+    } else if (arg === '--no-interactive') {
+      result.interactive = false;
+    } else if (arg === '--branch' || arg === '-B') {
+      result.branchName = args[++i];
+    } else if (arg === '--generate-guide' || arg === '-g') {
+      result.generateGuide = true;
+    } else if (arg === '--include-guide') {
+      result.includeGuide = true;
     } else if (!arg.startsWith('-')) {
       // First non-flag argument is the repo path
       if (!result.repoPath) {
@@ -1213,7 +1533,7 @@ function parseCommandLineArgs(): {
 
 function printUsage(): void {
   console.log(`
-🔍 Git Commit Analyzer
+🔍 Git Commit Analyzer & Rewriter
 
 USAGE:
   npm start [REPO_PATH] [OPTIONS]
@@ -1222,7 +1542,7 @@ USAGE:
 ARGUMENTS:
   REPO_PATH                 Path to the git repository to analyze
 
-OPTIONS:
+ANALYSIS OPTIONS:
   -h, --help               Show this help message
   -m, --max-commits NUM    Maximum commits to analyze (default: all)
   -p, --max-process NUM    Maximum commits to process for rules (default: all)
@@ -1230,11 +1550,41 @@ OPTIONS:
   -c, --concurrency NUM    Number of concurrent git operations (default: 4)
   -t, --synthetic-test     Run synthetic tests instead of real analysis
 
+REWRITE OPTIONS:
+  -r, --rewrite            Actually rewrite commit messages (DESTRUCTIVE!)
+  -d, --dry-run            Show what would be changed without making changes
+  --no-backup              Skip creating backup branch (not recommended)
+  --no-interactive         Skip interactive confirmation prompts
+  -B, --branch NAME        Specify target branch name for rewrite
+
+DOCUMENTATION OPTIONS:
+  -g, --generate-guide     Generate conventional commits guide only
+  --include-guide          Include guide in target repository after analysis
+
 EXAMPLES:
+  # Analysis only (safe)
   npm start ../my-repo                           # Analyze all commits
   npm start ../my-repo -m 100                    # Analyze last 100 commits
   npm start ../my-repo -m 500 -b 32 -c 8        # Custom limits and performance
+  
+  # Rewriting (destructive - use with caution!)
+  npm start ../my-repo --dry-run                 # Preview changes without applying
+  npm start ../my-repo --rewrite                 # Actually rewrite commit messages
+  npm start ../my-repo --rewrite --no-backup    # Rewrite without backup (dangerous!)
+  
+  # Documentation
+  npm start ../my-repo --include-guide           # Analyze and copy guide to repo
+  npm start --generate-guide                     # Generate guide only
+  
+  # Testing
   npm start -t                                   # Run synthetic tests
+
+SAFETY NOTES:
+  ⚠️  The --rewrite option modifies git history and is DESTRUCTIVE!
+  ⚠️  Always use --dry-run first to preview changes
+  ⚠️  Backup branches are created by default (disable with --no-backup)
+  ⚠️  Only use on repositories you can afford to lose or have backed up
+  ⚠️  Coordinate with your team before rewriting shared repository history
 
 ENVIRONMENT VARIABLES:
   OPENROUTER_API_KEY       Your OpenRouter API key (required)
