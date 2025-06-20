@@ -1,0 +1,40 @@
+{
+  "name": "git-commit-categories",
+  "version": "1.0.0",
+  "description": "A script to analyze and categorize git commit messages.",
+  "main": "commit-analyzer.ts",
+  "scripts": {
+    "start": "ts-node commit-analyzer.ts ../cline",
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "lint": "eslint .",
+    "format": "prettier --write \"**/*.{ts,js,json,md}\"",
+    "lint:knip": "knip",
+    "check": "npm run lint && npm run lint:knip"
+  },
+  "keywords": [
+    "git",
+    "commit",
+    "analysis",
+    "openai"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "dotenv": "^16.5.0",
+    "p-limit": "^6.2.0",
+    "tiktoken": "^1.0.21"
+  },
+  "devDependencies": {
+    "@eslint/js": "^8.56.0",
+    "@types/node": "^20.12.12",
+    "@typescript-eslint/eslint-plugin": "^7.0.0",
+    "@typescript-eslint/parser": "^7.0.0",
+    "eslint": "^8.56.0",
+    "eslint-config-prettier": "^9.0.0",
+    "eslint-plugin-prettier": "^5.0.0",
+    "knip": "^5.0.0",
+    "prettier": "^3.0.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.4.5"
+  }
+}
