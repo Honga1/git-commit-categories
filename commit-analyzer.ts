@@ -4,6 +4,8 @@ import { exec } from 'child_process';
 import { promisify } from 'util';
 import * as dotenv from 'dotenv';
 import { encoding_for_model } from 'tiktoken';
+import { createHash, randomBytes } from 'crypto';
+import { createServer } from 'http';
 
 // Load environment variables
 dotenv.config();
@@ -36,15 +38,307 @@ interface Config {
   syntheticTestMode: boolean;
 }
 
+// =================================================================
+// OAuth PKCE Flow for Seamless Authentication
+// =================================================================
+
+interface StoredCredentials {
+  apiKey: string;
+  expiresAt?: number;
+  userInfo?: {
+    email?: string;
+    name?: string;
+  };
+}
+
+async function getCredentialsPath(): Promise<string> {
+  const { homedir } = await import('os');
+  const { join } = await import('path');
+  const { mkdir } = await import('fs/promises');
+
+  const configDir = join(homedir(), '.config', 'git-commit-analyzer');
+  await mkdir(configDir, { recursive: true });
+  return join(configDir, 'credentials.json');
+}
+
+async function loadStoredCredentials(): Promise<StoredCredentials | null> {
+  try {
+    const { readFile } = await import('fs/promises');
+    const credentialsPath = await getCredentialsPath();
+    const data = await readFile(credentialsPath, 'utf8');
+    const credentials: StoredCredentials = JSON.parse(data);
+
+    // Check if credentials are expired
+    if (credentials.expiresAt && Date.now() > credentials.expiresAt) {
+      console.log('🔑 Stored credentials have expired');
+      return null;
+    }
+
+    return credentials;
+  } catch (error) {
+    // File doesn't exist or is corrupted
+    return null;
+  }
+}
+
+async function saveCredentials(credentials: StoredCredentials): Promise<void> {
+  try {
+    const { writeFile } = await import('fs/promises');
+    const credentialsPath = await getCredentialsPath();
+    await writeFile(credentialsPath, JSON.stringify(credentials, null, 2));
+    console.log('✅ Credentials saved securely');
+  } catch (error) {
+    console.warn('⚠️  Could not save credentials:', error);
+  }
+}
+
+async function clearStoredCredentials(): Promise<void> {
+  try {
+    const { unlink } = await import('fs/promises');
+    const credentialsPath = await getCredentialsPath();
+    await unlink(credentialsPath);
+    console.log('✅ Credentials cleared');
+  } catch (error) {
+    // File doesn't exist, which is fine
+  }
+}
+
+function generateCodeVerifier(): string {
+  const array = new Uint8Array(32);
+  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.getRandomValues) {
+    globalThis.crypto.getRandomValues(array);
+  } else {
+    // Fallback for Node.js environments
+    const bytes = randomBytes(32);
+    for (let i = 0; i < 32; i++) {
+      array[i] = bytes[i];
+    }
+  }
+  return Buffer.from(array).toString('base64url');
+}
+
+async function createSHA256CodeChallenge(input: string): Promise<string> {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(input);
+
+  let hash: ArrayBuffer;
+  if (typeof globalThis.crypto !== 'undefined' && globalThis.crypto.subtle) {
+    hash = await globalThis.crypto.subtle.digest('SHA-256', data);
+  } else {
+    // Fallback for Node.js environments
+    const hashBuffer = createHash('sha256').update(input).digest();
+    hash = hashBuffer.buffer.slice(
+      hashBuffer.byteOffset,
+      hashBuffer.byteOffset + hashBuffer.byteLength
+    );
+  }
+
+  return Buffer.from(hash).toString('base64url');
+}
+
+async function startOAuthFlow(): Promise<string> {
+  console.log('🔐 Starting secure OAuth login with OpenRouter...');
+
+  const codeVerifier = generateCodeVerifier();
+  const codeChallenge = await createSHA256CodeChallenge(codeVerifier);
+  const callbackUrl = 'http://localhost:8080/callback';
+
+  // Build the authorization URL
+  const authUrl = new URL('https://openrouter.ai/auth');
+  authUrl.searchParams.set('callback_url', callbackUrl);
+  authUrl.searchParams.set('code_challenge', codeChallenge);
+  authUrl.searchParams.set('code_challenge_method', 'S256');
+
+  console.log('🌐 Opening browser for authentication...');
+  console.log("📋 If the browser doesn't open automatically, visit:");
+  console.log(`   ${authUrl.toString()}`);
+
+  // Try to open the browser
+  try {
+    const { spawn } = await import('child_process');
+    const platform = process.platform;
+
+    if (platform === 'darwin') {
+      spawn('open', [authUrl.toString()]);
+    } else if (platform === 'win32') {
+      spawn('start', [authUrl.toString()], { shell: true });
+    } else {
+      spawn('xdg-open', [authUrl.toString()]);
+    }
+  } catch (error) {
+    console.warn('⚠️  Could not open browser automatically');
+  }
+
+  // Start a temporary HTTP server to receive the callback
+  const authCode = await startCallbackServer();
+
+  // Exchange the code for an API key
+  console.log('🔄 Exchanging authorization code for API key...');
+
+  try {
+    const response = await fetch('https://openrouter.ai/api/v1/auth/keys', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        code: authCode,
+        code_verifier: codeVerifier,
+        code_challenge_method: 'S256',
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(`OAuth exchange failed: ${response.status} ${errorText}`);
+    }
+
+    const data = await response.json();
+    if (!data.key) {
+      throw new Error('No API key received from OAuth exchange');
+    }
+
+    console.log('✅ Successfully authenticated with OpenRouter!');
+
+    // Save credentials with expiration (30 days)
+    const credentials: StoredCredentials = {
+      apiKey: data.key,
+      expiresAt: Date.now() + 30 * 24 * 60 * 60 * 1000, // 30 days
+      userInfo: data.user || {},
+    };
+
+    await saveCredentials(credentials);
+
+    if (credentials.userInfo?.email) {
+      console.log(`👋 Welcome, ${credentials.userInfo.email}!`);
+    }
+
+    return data.key;
+  } catch (error) {
+    console.error('❌ OAuth authentication failed:', error);
+    throw error;
+  }
+}
+
+async function startCallbackServer(): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const server = createServer((req: any, res: any) => {
+      const url = new URL(req.url, 'http://localhost:8080');
+
+      if (url.pathname === '/callback') {
+        const code = url.searchParams.get('code');
+        const error = url.searchParams.get('error');
+
+        if (error) {
+          res.writeHead(400, { 'Content-Type': 'text/html' });
+          res.end(`
+            <html>
+              <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1 style="color: #e74c3c;">❌ Authentication Failed</h1>
+                <p>Error: ${error}</p>
+                <p>You can close this window and try again.</p>
+              </body>
+            </html>
+          `);
+          server.close();
+          reject(new Error(`OAuth error: ${error}`));
+          return;
+        }
+
+        if (code) {
+          res.writeHead(200, { 'Content-Type': 'text/html' });
+          res.end(`
+            <html>
+              <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+                <h1 style="color: #27ae60;">✅ Authentication Successful!</h1>
+                <p>You can now close this window and return to your terminal.</p>
+                <script>
+                  setTimeout(() => window.close(), 3000);
+                </script>
+              </body>
+            </html>
+          `);
+          server.close();
+          resolve(code);
+          return;
+        }
+      }
+
+      // Default response
+      res.writeHead(404, { 'Content-Type': 'text/html' });
+      res.end(`
+        <html>
+          <body style="font-family: Arial, sans-serif; text-align: center; padding: 50px;">
+            <h1>🔐 Git Commit Analyzer</h1>
+            <p>Waiting for authentication...</p>
+          </body>
+        </html>
+      `);
+    });
+
+    server.listen(8080, 'localhost', () => {
+      console.log('🔗 Callback server started on http://localhost:8080');
+      console.log('⏳ Waiting for authentication...');
+    });
+
+    server.on('error', (error: any) => {
+      if (error.code === 'EADDRINUSE') {
+        console.error(
+          '❌ Port 8080 is already in use. Please close other applications using this port.'
+        );
+      }
+      reject(error);
+    });
+
+    // Timeout after 5 minutes
+    setTimeout(
+      () => {
+        server.close();
+        reject(new Error('Authentication timeout - please try again'));
+      },
+      5 * 60 * 1000
+    );
+  });
+}
+
 async function getOrCreateApiKey(): Promise<string> {
   // First check if API key is provided via environment
   if (process.env.OPENROUTER_API_KEY) {
+    console.log('🔑 Using API key from environment variables');
     return process.env.OPENROUTER_API_KEY;
   }
 
-  console.log('🔑 No API key found in environment variables.');
-  console.log('🚀 Attempting to get a temporary API key from OpenRouter...');
+  // Check for stored credentials
+  const storedCredentials = await loadStoredCredentials();
+  if (storedCredentials?.apiKey) {
+    console.log('🔑 Using stored credentials');
+    if (storedCredentials.userInfo?.email) {
+      console.log(`👋 Welcome back, ${storedCredentials.userInfo.email}!`);
+    }
+    return storedCredentials.apiKey;
+  }
 
+  console.log("🔑 No API key found. Let's get you authenticated!");
+  console.log('🚀 You have several options:');
+  console.log('   1. 🔐 Secure OAuth login (recommended) - stores credentials locally');
+  console.log('   2. 🔑 Manual API key - set OPENROUTER_API_KEY environment variable');
+  console.log('   3. 🧪 Try temporary guest access (very limited)');
+
+  // For CLI tools, we'll default to OAuth for the best experience
+  console.log('\n🔐 Starting OAuth authentication for the best experience...');
+
+  try {
+    return await startOAuthFlow();
+  } catch (error) {
+    console.warn('⚠️  OAuth authentication failed:', error);
+    console.log('\n🔄 Falling back to temporary access...');
+
+    // Fallback to temporary access
+    return await getTempApiKey();
+  }
+}
+
+async function getTempApiKey(): Promise<string> {
   try {
     // Try to get a temporary/guest API key from OpenRouter
     const response = await fetch('https://openrouter.ai/api/v1/auth/key', {
@@ -63,7 +357,7 @@ async function getOrCreateApiKey(): Promise<string> {
       const data = await response.json();
       if (data.key) {
         console.log('✅ Successfully obtained temporary API key!');
-        console.log('💡 For better rate limits, set OPENROUTER_API_KEY in your .env file');
+        console.log('💡 For unlimited usage, run: gca --login');
         return data.key;
       }
     }
@@ -80,8 +374,8 @@ async function getOrCreateApiKey(): Promise<string> {
     if (guestResponse.ok) {
       const guestData = await guestResponse.json();
       if (guestData.key) {
-        console.log('✅ Using guest API access (limited usage)');
-        console.log('💡 For unlimited usage, get your own API key at https://openrouter.ai/');
+        console.log('✅ Using guest API access (very limited usage)');
+        console.log('💡 For unlimited usage, run: gca --login');
         return guestData.key;
       }
     }
@@ -89,11 +383,11 @@ async function getOrCreateApiKey(): Promise<string> {
     console.warn('⚠️  Could not obtain automatic API key:', error);
   }
 
-  // Fallback: prompt user for manual setup
+  // Final fallback: prompt user for manual setup
   console.error('❌ Unable to obtain API key automatically.');
-  console.error('📝 Please get an API key from https://openrouter.ai/ and either:');
-  console.error('   1. Set OPENROUTER_API_KEY environment variable');
-  console.error('   2. Create a .env file with OPENROUTER_API_KEY=your_key_here');
+  console.error('📝 Please choose one of these options:');
+  console.error('   1. Run: gca --login (recommended)');
+  console.error('   2. Get an API key from https://openrouter.ai/ and set OPENROUTER_API_KEY');
   console.error('   3. Use: export OPENROUTER_API_KEY=your_key_here');
   process.exit(1);
 }
@@ -154,6 +448,342 @@ type TransformRule = {
   replacement: string;
   reason: string;
 };
+
+// =================================================================
+// Cache Management Types
+// =================================================================
+
+interface GcaCache {
+  version: string;
+  timestamp: string;
+  repoPath: string;
+  repoHash: string; // Git HEAD hash to detect repo changes
+
+  // Full config storage for restore functionality
+  config: Omit<Config, 'apiKey'> & { apiKeyHash: string };
+
+  // Environment context for reproducibility
+  environment: {
+    nodeVersion: string;
+    platform: string;
+    cwd: string;
+    gitVersion?: string;
+  };
+
+  progress: {
+    phase:
+      | 'fetching'
+      | 'enriching'
+      | 'classifying'
+      | 'generating_rules'
+      | 'applying_rules'
+      | 'complete';
+    totalCommits: number;
+    processedCommits: number;
+    lastProcessedHash?: string;
+    startTime: string;
+    lastUpdateTime: string;
+  };
+
+  data: {
+    rawCommits?: RawCommit[];
+    enrichedCommits?: EnrichedCommit[];
+    classifiedCommits?: ClassifiedCommit[];
+    transformRules?: SerializableTransformRule[];
+    finalCommits?: ClassifiedCommit[];
+  };
+
+  // State preservation for exact resumption
+  batchState?: {
+    currentBatchSize: number;
+    consecutiveSuccesses: number;
+    consecutiveFailures: number;
+    contextOverflowCount: number;
+  };
+
+  rateLimitState?: {
+    requestsThisMinute: number;
+    minuteStartTime: number;
+    dailyRequests: number;
+    dayStartTime: number;
+  };
+
+  // Metadata for cache management
+  metadata: {
+    cacheSize: number;
+    compressionUsed?: boolean;
+    checksums?: Record<string, string>;
+  };
+}
+
+interface SerializableTransformRule {
+  pattern: string;
+  flags: string;
+  replacement: string;
+  reason: string;
+}
+
+// =================================================================
+// Cache Management Utilities
+// =================================================================
+
+class CacheManager {
+  private static readonly CACHE_VERSION = '1.0.0';
+  private static readonly DEFAULT_CACHE_FILE = '.gca-cache.json';
+  private static readonly BACKUP_CACHE_FILE = '.gca-cache.backup.json';
+  private static readonly LOCK_FILE = '.gca-cache.lock';
+
+  static async getCacheFilePath(customPath?: string): Promise<string> {
+    const { resolve } = await import('path');
+    return customPath ? resolve(customPath) : resolve(this.DEFAULT_CACHE_FILE);
+  }
+
+  static async loadCache(cachePath?: string): Promise<GcaCache | null> {
+    try {
+      const { readFile } = await import('fs/promises');
+      const filePath = await this.getCacheFilePath(cachePath);
+      const data = await readFile(filePath, 'utf8');
+      const cache: GcaCache = JSON.parse(data);
+
+      // Validate cache version
+      if (cache.version !== this.CACHE_VERSION) {
+        console.log(
+          `⚠️  Cache version mismatch. Expected ${this.CACHE_VERSION}, got ${cache.version}`
+        );
+        return null;
+      }
+
+      console.log(`📂 Loaded cache from ${filePath}`);
+      console.log(`🕒 Cache created: ${new Date(cache.timestamp).toLocaleString()}`);
+      console.log(
+        `📊 Progress: ${cache.progress.phase} (${cache.progress.processedCommits}/${cache.progress.totalCommits})`
+      );
+
+      return cache;
+    } catch (error) {
+      if ((error as any).code === 'ENOENT') {
+        console.log('📂 No existing cache found');
+        return null;
+      }
+      console.warn('⚠️  Error loading cache:', error);
+      return null;
+    }
+  }
+
+  static async saveCache(cache: GcaCache, cachePath?: string): Promise<void> {
+    try {
+      const { writeFile } = await import('fs/promises');
+      const filePath = await this.getCacheFilePath(cachePath);
+
+      // Update metadata
+      const cacheData = JSON.stringify(cache, null, 2);
+      cache.metadata.cacheSize = Buffer.byteLength(cacheData, 'utf8');
+      cache.progress.lastUpdateTime = new Date().toISOString();
+
+      // Create backup of existing cache
+      try {
+        const { copyFile } = await import('fs/promises');
+        await copyFile(filePath, await this.getCacheFilePath(this.BACKUP_CACHE_FILE));
+      } catch (error) {
+        // Backup failed, but continue with save
+      }
+
+      // Atomic write using temporary file
+      const tempPath = `${filePath}.tmp`;
+      await writeFile(tempPath, JSON.stringify(cache, null, 2));
+
+      const { rename } = await import('fs/promises');
+      await rename(tempPath, filePath);
+
+      console.log(
+        `💾 Cache saved to ${filePath} (${Math.round(cache.metadata.cacheSize / 1024)}KB)`
+      );
+    } catch (error) {
+      console.error('❌ Error saving cache:', error);
+      throw error;
+    }
+  }
+
+  static async validateCache(cache: GcaCache, repoPath: string, config: Config): Promise<boolean> {
+    try {
+      // Check if repository has changed
+      const currentRepoHash = await this.getRepoHash(repoPath);
+      if (cache.repoHash !== currentRepoHash) {
+        console.log('⚠️  Repository has changed since cache was created');
+        return false;
+      }
+
+      // Check config compatibility (key settings)
+      const configHash = this.createConfigHash(config);
+      const cacheConfigHash = this.createConfigHash({
+        ...cache.config,
+        apiKey: config.apiKey, // Use current API key
+      } as Config);
+
+      if (configHash !== cacheConfigHash) {
+        console.log('⚠️  Configuration has changed since cache was created');
+        return false;
+      }
+
+      // Check if cache is too old (7 days)
+      const cacheAge = Date.now() - new Date(cache.timestamp).getTime();
+      const maxAge = 7 * 24 * 60 * 60 * 1000; // 7 days
+      if (cacheAge > maxAge) {
+        console.log('⚠️  Cache is too old (>7 days)');
+        return false;
+      }
+
+      return true;
+    } catch (error) {
+      console.warn('⚠️  Error validating cache:', error);
+      return false;
+    }
+  }
+
+  static async createCache(repoPath: string, config: Config): Promise<GcaCache> {
+    const repoHash = await this.getRepoHash(repoPath);
+    const { version: nodeVersion, platform } = process;
+
+    return {
+      version: this.CACHE_VERSION,
+      timestamp: new Date().toISOString(),
+      repoPath,
+      repoHash,
+      config: this.sanitizeConfig(config),
+      environment: {
+        nodeVersion,
+        platform,
+        cwd: process.cwd(),
+        gitVersion: await this.getGitVersion(),
+      },
+      progress: {
+        phase: 'fetching',
+        totalCommits: 0,
+        processedCommits: 0,
+        startTime: new Date().toISOString(),
+        lastUpdateTime: new Date().toISOString(),
+      },
+      data: {},
+      metadata: {
+        cacheSize: 0,
+      },
+    };
+  }
+
+  static async clearCache(cachePath?: string): Promise<void> {
+    try {
+      const { unlink } = await import('fs/promises');
+      const filePath = await this.getCacheFilePath(cachePath);
+      await unlink(filePath);
+      console.log(`🗑️  Cache cleared: ${filePath}`);
+    } catch (error) {
+      if ((error as any).code !== 'ENOENT') {
+        console.warn('⚠️  Error clearing cache:', error);
+      }
+    }
+  }
+
+  static async listCaches(): Promise<void> {
+    try {
+      const { readdir, stat } = await import('fs/promises');
+      const { resolve } = await import('path');
+
+      const files = await readdir('.');
+      const cacheFiles = files.filter(
+        (f) => f.endsWith('.gca-cache.json') || f === '.gca-cache.json'
+      );
+
+      if (cacheFiles.length === 0) {
+        console.log('📂 No cache files found');
+        return;
+      }
+
+      console.log('📂 Available cache files:');
+      for (const file of cacheFiles) {
+        try {
+          const filePath = resolve(file);
+          const stats = await stat(filePath);
+          const cache = await this.loadCache(filePath);
+
+          console.log(`\n📄 ${file}`);
+          console.log(`   Size: ${Math.round(stats.size / 1024)}KB`);
+          console.log(`   Modified: ${stats.mtime.toLocaleString()}`);
+
+          if (cache) {
+            console.log(`   Repo: ${cache.repoPath}`);
+            console.log(`   Phase: ${cache.progress.phase}`);
+            console.log(
+              `   Progress: ${cache.progress.processedCommits}/${cache.progress.totalCommits}`
+            );
+          }
+        } catch (error) {
+          console.log(`   ❌ Error reading cache: ${error}`);
+        }
+      }
+    } catch (error) {
+      console.error('❌ Error listing caches:', error);
+    }
+  }
+
+  private static async getRepoHash(repoPath: string): Promise<string> {
+    try {
+      const { stdout } = await execAsync('git rev-parse HEAD', { cwd: repoPath });
+      return stdout.trim();
+    } catch (error) {
+      console.warn('⚠️  Could not get repository hash:', error);
+      return 'unknown';
+    }
+  }
+
+  private static async getGitVersion(): Promise<string> {
+    try {
+      const { stdout } = await execAsync('git --version');
+      return stdout.trim();
+    } catch (error) {
+      return 'unknown';
+    }
+  }
+
+  private static sanitizeConfig(config: Config): Omit<Config, 'apiKey'> & { apiKeyHash: string } {
+    const { apiKey, ...sanitizedConfig } = config;
+    return {
+      ...sanitizedConfig,
+      apiKeyHash: createHash('sha256').update(apiKey).digest('hex').substring(0, 16),
+    };
+  }
+
+  private static createConfigHash(config: Config): string {
+    const relevantConfig = {
+      classificationModel: config.classificationModel,
+      ruleGenerationModel: config.ruleGenerationModel,
+      maxCommitsToAnalyze: config.maxCommitsToAnalyze,
+      maxCommitsToProcess: config.maxCommitsToProcess,
+      initialBatchSize: config.initialBatchSize,
+      contextLimitThreshold: config.contextLimitThreshold,
+    };
+    return createHash('sha256')
+      .update(JSON.stringify(relevantConfig))
+      .digest('hex')
+      .substring(0, 16);
+  }
+
+  static serializeTransformRules(rules: TransformRule[]): SerializableTransformRule[] {
+    return rules.map((rule) => ({
+      pattern: rule.pattern.source,
+      flags: rule.pattern.flags,
+      replacement: rule.replacement,
+      reason: rule.reason,
+    }));
+  }
+
+  static deserializeTransformRules(rules: SerializableTransformRule[]): TransformRule[] {
+    return rules.map((rule) => ({
+      pattern: new RegExp(rule.pattern, rule.flags),
+      replacement: rule.replacement,
+      reason: rule.reason,
+    }));
+  }
+}
 
 // =================================================================
 // Utility Functions
@@ -1459,18 +2089,51 @@ async function executeInteractiveRebase(
 }
 
 async function generateConventionalCommitsGuide(outputPath: string): Promise<void> {
-  console.log('\n📚 Generating Conventional Commits Guide...');
+  console.log('📚 Generating Conventional Commits Guide...');
 
-  // The guide is already created as CONVENTIONAL_COMMITS_GUIDE.md
-  // Here we could copy it to the target repository or create a customized version
+  const guidePath = `${outputPath}/CONVENTIONAL_COMMITS_GUIDE.md`;
+  const sourceGuidePath = `${process.cwd()}/CONVENTIONAL_COMMITS_GUIDE.md`;
 
   try {
-    const guidePath = `${outputPath}/CONVENTIONAL_COMMITS_GUIDE.md`;
-    await execAsync(`cp CONVENTIONAL_COMMITS_GUIDE.md "${guidePath}"`, {});
-    console.log(`✅ Conventional Commits Guide saved to: ${guidePath}`);
+    // Check if guide already exists at destination
+    const { access } = await import('fs/promises');
+    await access(guidePath);
+
+    // File exists, ask user what to do
+    console.log(`📄 Conventional Commits Guide already exists at: ${guidePath}`);
+    console.log('🤔 What would you like to do?');
+    console.log('   1. Overwrite the existing guide');
+    console.log('   2. Keep the existing guide (skip)');
+    console.log('   3. Delete the existing guide');
+
+    // For now, we'll default to option 2 (keep existing) to be safe
+    // In a real implementation, you could add interactive prompting here
+    console.log('💡 Defaulting to option 2: Keeping existing guide');
+    console.log('✅ Existing guide preserved. No changes made.');
   } catch (error) {
-    console.warn('⚠️  Could not copy guide to target repository:', error);
-    console.log('📖 Guide is available in the current directory as CONVENTIONAL_COMMITS_GUIDE.md');
+    // File doesn't exist at destination, proceed with creation
+    try {
+      // Check if we're trying to copy to the same location
+      if (outputPath === '.' || outputPath === process.cwd()) {
+        console.log(
+          '📖 Guide already exists in current directory as CONVENTIONAL_COMMITS_GUIDE.md'
+        );
+        return;
+      }
+
+      // Check if source guide exists
+      const { access: fsAccess } = await import('fs/promises');
+      await fsAccess(sourceGuidePath);
+
+      // Copy the guide to the destination
+      await execAsync(`cp "${sourceGuidePath}" "${guidePath}"`, {});
+      console.log(`✅ Conventional Commits Guide copied to: ${guidePath}`);
+    } catch (copyError) {
+      console.warn('⚠️  Could not copy guide to target directory:', copyError);
+      console.log(
+        '📖 Guide is available in the current directory as CONVENTIONAL_COMMITS_GUIDE.md'
+      );
+    }
   }
 }
 
@@ -1479,7 +2142,6 @@ async function generateConventionalCommitsGuide(outputPath: string): Promise<voi
 // =================================================================
 
 async function main(): Promise<void> {
-  const config = await loadAndValidateConfig();
   const cliArgs = parseCommandLineArgs();
 
   if (cliArgs.help) {
@@ -1487,9 +2149,125 @@ async function main(): Promise<void> {
     return;
   }
 
+  // Handle guide generation FIRST (doesn't need any config or authentication)
   if (cliArgs.generateGuide) {
     const outputPath = cliArgs.repoPath || '.';
     await generateConventionalCommitsGuide(outputPath);
+    return;
+  }
+
+  // Handle cache management commands (before loading config)
+  if (cliArgs.listCaches) {
+    await CacheManager.listCaches();
+    return;
+  }
+
+  if (cliArgs.clearCache) {
+    await CacheManager.clearCache();
+    return;
+  }
+
+  if (cliArgs.cacheInfo) {
+    const cache = await CacheManager.loadCache(cliArgs.cacheInfo);
+    if (cache) {
+      console.log('📊 Cache Information:');
+      console.log(`📂 File: ${cliArgs.cacheInfo}`);
+      console.log(`📅 Created: ${new Date(cache.timestamp).toLocaleString()}`);
+      console.log(`📍 Repository: ${cache.repoPath}`);
+      console.log(`🔗 Repo Hash: ${cache.repoHash}`);
+      console.log(`📊 Phase: ${cache.progress.phase}`);
+      console.log(`📈 Progress: ${cache.progress.processedCommits}/${cache.progress.totalCommits}`);
+      console.log(`💾 Size: ${Math.round(cache.metadata.cacheSize / 1024)}KB`);
+      console.log(`🔧 Config Hash: ${cache.config.apiKeyHash}`);
+      console.log(
+        `🖥️  Environment: ${cache.environment.platform} ${cache.environment.nodeVersion}`
+      );
+    } else {
+      console.log('❌ Could not load cache file');
+    }
+    return;
+  }
+
+  if (cliArgs.validateCache) {
+    const cache = await CacheManager.loadCache(cliArgs.validateCache);
+    if (cache) {
+      console.log('🔍 Validating cache...');
+      // We need config to validate, so we'll load it
+      const config = await loadAndValidateConfig();
+      const isValid = await CacheManager.validateCache(cache, cache.repoPath, config);
+      console.log(`✅ Cache validation: ${isValid ? 'VALID' : 'INVALID'}`);
+    } else {
+      console.log('❌ Could not load cache file for validation');
+    }
+    return;
+  }
+
+  // Handle authentication commands (before loading config)
+  if (cliArgs.login) {
+    console.log('🔐 Starting OAuth login process...');
+    try {
+      await startOAuthFlow();
+      console.log('✅ Login successful! You can now use the analyzer.');
+    } catch (error) {
+      console.error('❌ Login failed:', error);
+      process.exit(1);
+    }
+    return;
+  }
+
+  if (cliArgs.logout) {
+    console.log('🔓 Logging out...');
+    await clearStoredCredentials();
+    console.log('✅ Successfully logged out. Stored credentials have been cleared.');
+    return;
+  }
+
+  if (cliArgs.status) {
+    console.log('📊 Authentication Status:');
+
+    // Check environment variable
+    if (process.env.OPENROUTER_API_KEY) {
+      console.log('🔑 API Key: Set via environment variable');
+    } else {
+      console.log('🔑 API Key: Not set in environment');
+    }
+
+    // Check stored credentials
+    const storedCredentials = await loadStoredCredentials();
+    if (storedCredentials?.apiKey) {
+      console.log('💾 Stored Credentials: ✅ Available');
+      if (storedCredentials.userInfo?.email) {
+        console.log(`👤 User: ${storedCredentials.userInfo.email}`);
+      }
+      if (storedCredentials.expiresAt) {
+        const expiresDate = new Date(storedCredentials.expiresAt);
+        const daysUntilExpiry = Math.ceil(
+          (storedCredentials.expiresAt - Date.now()) / (1000 * 60 * 60 * 24)
+        );
+        console.log(`⏰ Expires: ${expiresDate.toLocaleDateString()} (${daysUntilExpiry} days)`);
+      }
+    } else {
+      console.log('💾 Stored Credentials: ❌ Not available');
+    }
+
+    // Overall status
+    if (process.env.OPENROUTER_API_KEY || storedCredentials?.apiKey) {
+      console.log('\n✅ Ready to use! Authentication is configured.');
+    } else {
+      console.log('\n❌ Not authenticated. Run `gca --login` to get started.');
+    }
+    return;
+  }
+
+  // Load config after handling auth commands
+  const config = await loadAndValidateConfig();
+
+  // Handle synthetic test mode first (doesn't need repo path)
+  if (config.syntheticTestMode || cliArgs.syntheticTest) {
+    await runSyntheticTests(config);
+    console.log(
+      '\nSynthetic test run complete. To run on real data, set SYNTHETIC_TEST_MODE=false in .env'
+    );
     return;
   }
 
@@ -1503,12 +2281,193 @@ async function main(): Promise<void> {
   console.log(`Analyzing git repository at: ${repoPath}`);
   console.log('Starting commit analysis script...');
 
-  if (config.syntheticTestMode) {
-    await runSyntheticTests(config);
-    console.log(
-      '\nSynthetic test run complete. To run on real data, set SYNTHETIC_TEST_MODE=false in .env'
-    );
-    return;
+  // Handle cache restore functionality
+  if (cliArgs.restore) {
+    const cachePath = typeof cliArgs.restore === 'string' ? cliArgs.restore : undefined;
+    const cache = await CacheManager.loadCache(cachePath);
+
+    if (cache) {
+      const isValid = await CacheManager.validateCache(cache, repoPath, config);
+      if (isValid) {
+        console.log('🔄 Restoring from cache...');
+
+        // Restore from the appropriate phase
+        if (cache.progress.phase === 'complete' && cache.data.finalCommits) {
+          console.log('✅ Cache contains complete analysis, generating report...');
+          const rules = cache.data.transformRules
+            ? CacheManager.deserializeTransformRules(cache.data.transformRules)
+            : [];
+          generateAnalysisReport(
+            cache.data.classifiedCommits || [],
+            cache.data.finalCommits,
+            rules
+          );
+          return;
+        } else if (cache.progress.phase === 'applying_rules' && cache.data.transformRules) {
+          console.log('📊 Resuming from applying rules phase...');
+          const rules = CacheManager.deserializeTransformRules(cache.data.transformRules);
+
+          console.log('\n⚙️  Applying rules to all commits...');
+          const allRawCommits = await parseCommitEntries(
+            await getGitLogEntries(repoPath, config.maxCommitsToProcess)
+          );
+          const finalCommits = applyTransformRules(allRawCommits, rules);
+
+          // Update cache with final results
+          cache.progress.phase = 'complete';
+          cache.progress.processedCommits = finalCommits.length;
+          cache.data.finalCommits = finalCommits;
+          await CacheManager.saveCache(cache);
+
+          console.log('\n📊 Generating analysis report...');
+          generateAnalysisReport(cache.data.classifiedCommits || [], finalCommits, rules);
+          return;
+        } else if (cache.progress.phase === 'generating_rules' && cache.data.classifiedCommits) {
+          console.log('📊 Resuming from rule generation phase...');
+
+          console.log('\n🔧 Generating transformation rules...');
+          const rateLimitManager = new RateLimitManager(config);
+          await rateLimitManager.updateApiKeyInfo();
+          const rules = await generateTransformationRules(
+            config,
+            cache.data.classifiedCommits,
+            rateLimitManager
+          );
+
+          // Update cache after rule generation
+          cache.progress.phase = 'applying_rules';
+          cache.data.transformRules = CacheManager.serializeTransformRules(rules);
+          await CacheManager.saveCache(cache);
+
+          console.log('\n⚙️  Applying rules to all commits...');
+          const allRawCommits = await parseCommitEntries(
+            await getGitLogEntries(repoPath, config.maxCommitsToProcess)
+          );
+          const finalCommits = applyTransformRules(allRawCommits, rules);
+
+          // Update cache with final results
+          cache.progress.phase = 'complete';
+          cache.progress.processedCommits = finalCommits.length;
+          cache.data.finalCommits = finalCommits;
+          await CacheManager.saveCache(cache);
+
+          console.log('\n📊 Generating analysis report...');
+          generateAnalysisReport(cache.data.classifiedCommits, finalCommits, rules);
+          return;
+        } else if (cache.progress.phase === 'classifying' && cache.data.enrichedCommits) {
+          console.log('📊 Resuming from classification phase...');
+
+          console.log('\n🤖 Classifying commits with AI...');
+          const classifiedCommits = await processCommitsInAdaptiveBatches(
+            config,
+            cache.data.enrichedCommits
+          );
+
+          // Update cache after classification
+          cache.progress.phase = 'generating_rules';
+          cache.progress.processedCommits = classifiedCommits.length;
+          cache.data.classifiedCommits = classifiedCommits;
+          await CacheManager.saveCache(cache);
+
+          console.log('\n🔧 Generating transformation rules...');
+          const rateLimitManager = new RateLimitManager(config);
+          await rateLimitManager.updateApiKeyInfo();
+          const rules = await generateTransformationRules(
+            config,
+            classifiedCommits,
+            rateLimitManager
+          );
+
+          // Update cache after rule generation
+          cache.progress.phase = 'applying_rules';
+          cache.data.transformRules = CacheManager.serializeTransformRules(rules);
+          await CacheManager.saveCache(cache);
+
+          console.log('\n⚙️  Applying rules to all commits...');
+          const allRawCommits = await parseCommitEntries(
+            await getGitLogEntries(repoPath, config.maxCommitsToProcess)
+          );
+          const finalCommits = applyTransformRules(allRawCommits, rules);
+
+          // Update cache with final results
+          cache.progress.phase = 'complete';
+          cache.progress.processedCommits = finalCommits.length;
+          cache.data.finalCommits = finalCommits;
+          await CacheManager.saveCache(cache);
+
+          console.log('\n📊 Generating analysis report...');
+          generateAnalysisReport(classifiedCommits, finalCommits, rules);
+          return;
+        } else if (cache.progress.phase === 'enriching' && cache.data.rawCommits) {
+          console.log('📊 Resuming from enriching phase...');
+
+          console.log('\n📊 Enriching commits with diff summaries...');
+          const enrichedCommits = await enrichCommitsWithDiffs(
+            cache.data.rawCommits,
+            repoPath,
+            config.diffConcurrency
+          );
+
+          // Update cache after enriching
+          cache.progress.phase = 'classifying';
+          cache.progress.processedCommits = enrichedCommits.length;
+          cache.data.enrichedCommits = enrichedCommits;
+          await CacheManager.saveCache(cache);
+
+          console.log('\n🤖 Classifying commits with AI...');
+          const classifiedCommits = await processCommitsInAdaptiveBatches(config, enrichedCommits);
+
+          // Update cache after classification
+          cache.progress.phase = 'generating_rules';
+          cache.progress.processedCommits = classifiedCommits.length;
+          cache.data.classifiedCommits = classifiedCommits;
+          await CacheManager.saveCache(cache);
+
+          console.log('\n🔧 Generating transformation rules...');
+          const rateLimitManager = new RateLimitManager(config);
+          await rateLimitManager.updateApiKeyInfo();
+          const rules = await generateTransformationRules(
+            config,
+            classifiedCommits,
+            rateLimitManager
+          );
+
+          // Update cache after rule generation
+          cache.progress.phase = 'applying_rules';
+          cache.data.transformRules = CacheManager.serializeTransformRules(rules);
+          await CacheManager.saveCache(cache);
+
+          console.log('\n⚙️  Applying rules to all commits...');
+          const allRawCommits = await parseCommitEntries(
+            await getGitLogEntries(repoPath, config.maxCommitsToProcess)
+          );
+          const finalCommits = applyTransformRules(allRawCommits, rules);
+
+          // Update cache with final results
+          cache.progress.phase = 'complete';
+          cache.progress.processedCommits = finalCommits.length;
+          cache.data.finalCommits = finalCommits;
+          await CacheManager.saveCache(cache);
+
+          console.log('\n📊 Generating analysis report...');
+          generateAnalysisReport(classifiedCommits, finalCommits, rules);
+          return;
+        } else {
+          console.log(`📊 Resuming from phase: ${cache.progress.phase}`);
+          console.log('💡 Partial cache found, but continuing with fresh analysis for safety...');
+        }
+      } else {
+        console.log('⚠️  Cache is invalid, starting fresh analysis...');
+      }
+    } else {
+      console.log('❌ Could not load cache, starting fresh analysis...');
+    }
+  }
+
+  // Initialize cache for new analysis
+  let cache: GcaCache | null = null;
+  if (!cliArgs.ignoreCache) {
+    cache = await CacheManager.createCache(repoPath, config);
   }
 
   // Real data processing
@@ -1517,6 +2476,14 @@ async function main(): Promise<void> {
   const rawCommits = await parseCommitEntries(logEntries);
   console.log(`📋 Found ${rawCommits.length} commits`);
 
+  // Update cache with raw commits
+  if (cache) {
+    cache.progress.phase = 'enriching';
+    cache.progress.totalCommits = rawCommits.length;
+    cache.data.rawCommits = rawCommits;
+    await CacheManager.saveCache(cache);
+  }
+
   console.log('\n📊 Enriching commits with diff summaries...');
   const enrichedCommits = await enrichCommitsWithDiffs(
     rawCommits,
@@ -1524,19 +2491,50 @@ async function main(): Promise<void> {
     config.diffConcurrency
   );
 
+  // Update cache after enriching
+  if (cache) {
+    cache.progress.phase = 'classifying';
+    cache.progress.processedCommits = enrichedCommits.length;
+    cache.data.enrichedCommits = enrichedCommits;
+    await CacheManager.saveCache(cache);
+  }
+
   console.log('\n🤖 Classifying commits with AI...');
   const classifiedCommits = await processCommitsInAdaptiveBatches(config, enrichedCommits);
+
+  // Update cache after classification
+  if (cache) {
+    cache.progress.phase = 'generating_rules';
+    cache.progress.processedCommits = classifiedCommits.length;
+    cache.data.classifiedCommits = classifiedCommits;
+    await CacheManager.saveCache(cache);
+  }
 
   console.log('\n🔧 Generating transformation rules...');
   const rateLimitManager = new RateLimitManager(config);
   await rateLimitManager.updateApiKeyInfo();
   const rules = await generateTransformationRules(config, classifiedCommits, rateLimitManager);
 
+  // Update cache after rule generation
+  if (cache) {
+    cache.progress.phase = 'applying_rules';
+    cache.data.transformRules = CacheManager.serializeTransformRules(rules);
+    await CacheManager.saveCache(cache);
+  }
+
   console.log('\n⚙️  Applying rules to all commits...');
   const allRawCommits = await parseCommitEntries(
     await getGitLogEntries(repoPath, config.maxCommitsToProcess)
   );
   const finalCommits = applyTransformRules(allRawCommits, rules);
+
+  // Update cache with final results
+  if (cache) {
+    cache.progress.phase = 'complete';
+    cache.progress.processedCommits = finalCommits.length;
+    cache.data.finalCommits = finalCommits;
+    await CacheManager.saveCache(cache);
+  }
 
   console.log('\n📊 Generating analysis report...');
   generateAnalysisReport(classifiedCommits, finalCommits, rules);
@@ -1605,6 +2603,22 @@ function parseCommandLineArgs(): {
   branchName?: string;
   generateGuide?: boolean;
   includeGuide?: boolean;
+  login?: boolean;
+  logout?: boolean;
+  status?: boolean;
+  // Cache management options
+  restore?: string | boolean;
+  importCache?: string;
+  exportCache?: string;
+  listCaches?: boolean;
+  cacheInfo?: string;
+  validateCache?: string;
+  checkCompatibility?: string;
+  cleanCache?: boolean;
+  olderThan?: string;
+  ignoreCache?: boolean;
+  clearCache?: boolean;
+  cacheOnly?: boolean;
 } {
   const args = process.argv.slice(2);
   const result: any = {};
@@ -1638,6 +2652,40 @@ function parseCommandLineArgs(): {
       result.generateGuide = true;
     } else if (arg === '--include-guide') {
       result.includeGuide = true;
+    } else if (arg === '--login') {
+      result.login = true;
+    } else if (arg === '--logout') {
+      result.logout = true;
+    } else if (arg === '--status') {
+      result.status = true;
+    } else if (arg === '--restore') {
+      if (i + 1 < args.length && !args[i + 1].startsWith('-')) {
+        result.restore = args[++i];
+      } else {
+        result.restore = true; // Use default cache file
+      }
+    } else if (arg === '--import-cache') {
+      result.importCache = args[++i];
+    } else if (arg === '--export-cache') {
+      result.exportCache = args[++i];
+    } else if (arg === '--list-caches') {
+      result.listCaches = true;
+    } else if (arg === '--cache-info') {
+      result.cacheInfo = args[++i];
+    } else if (arg === '--validate-cache') {
+      result.validateCache = args[++i];
+    } else if (arg === '--check-compatibility') {
+      result.checkCompatibility = args[++i];
+    } else if (arg === '--clean-cache') {
+      result.cleanCache = true;
+    } else if (arg === '--older-than') {
+      result.olderThan = args[++i];
+    } else if (arg === '--ignore-cache') {
+      result.ignoreCache = true;
+    } else if (arg === '--clear-cache') {
+      result.clearCache = true;
+    } else if (arg === '--cache-only') {
+      result.cacheOnly = true;
     } else if (!arg.startsWith('-')) {
       // First non-flag argument is the repo path
       if (!result.repoPath) {
@@ -1677,11 +2725,29 @@ REWRITE OPTIONS:
   --no-interactive         Skip interactive confirmation prompts
   -B, --branch NAME        Specify target branch name for rewrite
 
+AUTHENTICATION OPTIONS:
+  --login                  Login with OAuth to OpenRouter (stores credentials)
+  --logout                 Logout and clear stored credentials
+  --status                 Show current authentication status
+
+CACHE MANAGEMENT OPTIONS:
+  --restore [FILE]         Restore from cache file (default: .gca-cache.json)
+  --list-caches            List all available cache files
+  --cache-info FILE        Show detailed information about a cache file
+  --validate-cache FILE    Validate cache file compatibility
+  --clear-cache            Delete the default cache file
+  --ignore-cache           Skip cache creation and usage
+
 DOCUMENTATION OPTIONS:
   -g, --generate-guide     Generate conventional commits guide only
   --include-guide          Include guide in target repository after analysis
 
 EXAMPLES:
+  # Authentication
+  gca --login                                    # Login with OAuth (recommended)
+  gca --logout                                   # Logout and clear credentials
+  gca --status                                   # Check authentication status
+  
   # Analysis only (safe)
   npm start ../my-repo                           # Analyze all commits
   npm start ../my-repo -m 100                    # Analyze last 100 commits

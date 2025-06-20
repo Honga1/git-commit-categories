@@ -265,28 +265,88 @@ The tool analyzes commits against conventional commit standards:
 - `perf:` - Performance improvements
 - `revert:` - Reverting changes
 
-## API Requirements
+## Authentication
 
-🎉 **NEW: Automatic API Key Management!**
+🎉 **NEW: OAuth Authentication with Secure Credential Storage!**
 
-The tool now automatically obtains temporary API keys from OpenRouter when none is provided! No manual setup required for basic usage.
+The tool now supports multiple authentication methods for maximum convenience and security.
 
-### Automatic Mode (Recommended for Quick Start)
+### Option 1: OAuth Login (Recommended)
 
-- Just run the tool - it will automatically get a temporary API key
-- Limited usage but perfect for trying out the tool
-- No manual configuration needed
+The easiest and most secure way to authenticate:
 
-### Manual API Key (Recommended for Heavy Usage)
+```bash
+# Login with OAuth (opens browser, stores credentials securely)
+gca --login
 
-For unlimited usage and better rate limits:
+# Check authentication status
+gca --status
+
+# Logout and clear stored credentials
+gca --logout
+```
+
+**Benefits:**
+
+- ✅ Secure browser-based authentication
+- ✅ Credentials stored locally and encrypted
+- ✅ Automatic token refresh
+- ✅ No manual API key management
+- ✅ Full access to your OpenRouter account
+
+### Option 2: Manual API Key
+
+For automated environments or if you prefer manual setup:
+
+```bash
+# Set environment variable
+export OPENROUTER_API_KEY=your_api_key_here
+
+# Or add to .env file
+echo "OPENROUTER_API_KEY=your_api_key_here" >> .env
+```
+
+**Steps:**
 
 1. Sign up at [OpenRouter](https://openrouter.ai/)
 2. Get your API key from the dashboard
 3. Add credits to your account (free tier available)
 4. Set the `OPENROUTER_API_KEY` environment variable
 
-The tool will automatically detect and use your manual API key if provided, otherwise it falls back to automatic temporary keys.
+### Option 3: Automatic Temporary Access
+
+For quick testing without any setup:
+
+- Just run the tool - it will automatically get a temporary API key
+- Very limited usage but perfect for trying out the tool
+- No configuration needed
+
+### Authentication Priority
+
+The tool checks for authentication in this order:
+
+1. Environment variable (`OPENROUTER_API_KEY`)
+2. Stored OAuth credentials (`~/.config/git-commit-analyzer/credentials.json`)
+3. Automatic temporary access (fallback)
+
+### Managing Stored Credentials
+
+```bash
+# Check what's currently configured
+gca --status
+
+# Login with OAuth (recommended for regular use)
+gca --login
+
+# Clear stored credentials
+gca --logout
+```
+
+Stored credentials are kept in `~/.config/git-commit-analyzer/credentials.json` and include:
+
+- Encrypted API key
+- Expiration date (30 days)
+- User information (email, name)
 
 ## Troubleshooting
 
