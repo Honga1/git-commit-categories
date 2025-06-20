@@ -2,10 +2,10 @@
   "name": "@honga/repo",
   "version": "1.2.0",
   "description": "AI-powered Git commit analyzer and rewriter with conventional commit standards support",
-  "main": "dist/commit-analyzer.js",
+  "main": "dist/main.js",
   "bin": {
-    "git-commit-analyzer": "dist/commit-analyzer.js",
-    "gca": "dist/commit-analyzer.js"
+    "git-commit-analyzer": "dist/main.js",
+    "gca": "dist/main.js"
   },
   "files": [
     "dist/**/*",
@@ -16,9 +16,12 @@
   ],
   "scripts": {
     "build": "tsc",
-    "start": "ts-node commit-analyzer.ts ../cline",
+    "start": "ts-node src/main.ts",
     "prepublishOnly": "npm run build",
-    "test": "echo \"Error: no test specified\" && exit 1",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:ui": "vitest --ui",
+    "test:e2e": "vitest run tests/e2e",
     "lint": "eslint .",
     "format": "prettier --write \"**/*.{ts,js,json,md}\"",
     "lint:knip": "knip",
@@ -47,20 +50,23 @@
   },
   "license": "ISC",
   "dependencies": {
-    "dotenv": "^16.5.0",
-    "tiktoken": "^1.0.21"
+    "dotenv": "^16.5.0"
   },
   "devDependencies": {
-    "@eslint/js": "^8.56.0",
-    "@types/node": "^20.12.12",
-    "@typescript-eslint/eslint-plugin": "^7.0.0",
-    "@typescript-eslint/parser": "^7.0.0",
-    "eslint": "^8.56.0",
-    "eslint-config-prettier": "^9.0.0",
-    "eslint-plugin-prettier": "^5.0.0",
-    "knip": "^5.0.0",
-    "prettier": "^3.0.0",
+    "@eslint/js": "^9.29.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^24.0.3",
+    "@typescript-eslint/eslint-plugin": "^8.34.1",
+    "@typescript-eslint/parser": "^8.34.1",
+    "@vitest/ui": "^3.2.4",
+    "eslint": "^9.29.0",
+    "eslint-config-prettier": "^10.1.5",
+    "eslint-plugin-prettier": "^5.5.0",
+    "jsdom": "^26.1.0",
+    "knip": "^5.61.2",
+    "prettier": "^3.5.3",
     "ts-node": "^10.9.2",
-    "typescript": "^5.4.5"
+    "typescript": "^5.8.3",
+    "vitest": "^3.2.4"
   }
 }

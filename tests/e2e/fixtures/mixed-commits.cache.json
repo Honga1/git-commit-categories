@@ -1,0 +1,59 @@
+{
+  "repositoryPath": "/test/mixed-commits",
+  "commits": [
+    {
+      "hash": "def456ghi789",
+      "message": "feat: add user authentication",
+      "author": "Dev User <dev@example.com>",
+      "date": "2024-01-02T00:00:00Z",
+      "files": [
+        "auth.js"
+      ],
+      "diff": "diff --git a/auth.js b/auth.js\nnew file mode 100644\nindex 0000000..1234567\n--- /dev/null\n+++ b/auth.js\n@@ -0,0 +1,5 @@\n+function authenticate(user) {\n+  return user.isValid;\n+}"
+    },
+    {
+      "hash": "ghi789jkl012",
+      "message": "fix: resolve login bug",
+      "author": "Dev User <dev@example.com>",
+      "date": "2024-01-03T00:00:00Z",
+      "files": [
+        "auth.js"
+      ],
+      "diff": "diff --git a/auth.js b/auth.js\nindex 1234567..abcdefg 100644\n--- a/auth.js\n+++ b/auth.js\n@@ -1,5 +1,5 @@\n function authenticate(user) {\n-  return user.isValid;\n+  return user && user.isValid;\n }"
+    },
+    {
+      "hash": "jkl012mno345",
+      "message": "update readme",
+      "author": "Dev User <dev@example.com>",
+      "date": "2024-01-04T00:00:00Z",
+      "files": [
+        "README.md"
+      ],
+      "diff": "diff --git a/README.md b/README.md\nindex 0000000..1111111 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,3 @@\n # Test Project\n+\n+Updated with more info"
+    },
+    {
+      "hash": "mno345pqr678",
+      "message": "docs: add API documentation",
+      "author": "Dev User <dev@example.com>",
+      "date": "2024-01-05T00:00:00Z",
+      "files": [
+        "docs/api.md"
+      ],
+      "diff": "diff --git a/docs/api.md b/docs/api.md\nnew file mode 100644\nindex 0000000..2222222\n--- /dev/null\n+++ b/docs/api.md\n@@ -0,0 +1,3 @@\n+# API Documentation\n+\n+Authentication endpoint: /auth"
+    }
+  ],
+  "insights": {
+    "totalCommits": 4,
+    "currentBranch": "main",
+    "isClean": true,
+    "commonFileTypes": {
+      ".js": 1,
+      ".md": 2
+    }
+  },
+  "metadata": {
+    "cacheVersion": "1.0.0",
+    "createdAt": "2024-01-05T00:00:00Z",
+    "toolVersion": "1.2.0"
+  }
+}
