@@ -1,6 +1,6 @@
 {
   "name": "@honga/repo",
-  "version": "1.0.0",
+  "version": "1.2.0",
   "description": "AI-powered Git commit analyzer and rewriter with conventional commit standards support",
   "main": "dist/commit-analyzer.js",
   "bin": {

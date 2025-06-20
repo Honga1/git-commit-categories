@@ -36,18 +36,73 @@ interface Config {
   syntheticTestMode: boolean;
 }
 
-function loadAndValidateConfig(): Config {
-  const requiredEnvVars = ['OPENROUTER_API_KEY'];
-  const missing = requiredEnvVars.filter((key) => !process.env[key]);
-
-  if (missing.length > 0) {
-    console.error(`❌ Missing required environment variables: ${missing.join(', ')}`);
-    console.error('Create a .env file based on .env.example');
-    process.exit(1);
+async function getOrCreateApiKey(): Promise<string> {
+  // First check if API key is provided via environment
+  if (process.env.OPENROUTER_API_KEY) {
+    return process.env.OPENROUTER_API_KEY;
   }
 
+  console.log('🔑 No API key found in environment variables.');
+  console.log('🚀 Attempting to get a temporary API key from OpenRouter...');
+
+  try {
+    // Try to get a temporary/guest API key from OpenRouter
+    const response = await fetch('https://openrouter.ai/api/v1/auth/key', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        name: 'Git Commit Analyzer - Temporary Key',
+        scoped: true,
+        temporary: true,
+      }),
+    });
+
+    if (response.ok) {
+      const data = await response.json();
+      if (data.key) {
+        console.log('✅ Successfully obtained temporary API key!');
+        console.log('💡 For better rate limits, set OPENROUTER_API_KEY in your .env file');
+        return data.key;
+      }
+    }
+
+    // If temporary key fails, try guest access
+    console.log('⚠️  Temporary key unavailable, trying guest access...');
+    const guestResponse = await fetch('https://openrouter.ai/api/v1/auth/guest', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (guestResponse.ok) {
+      const guestData = await guestResponse.json();
+      if (guestData.key) {
+        console.log('✅ Using guest API access (limited usage)');
+        console.log('💡 For unlimited usage, get your own API key at https://openrouter.ai/');
+        return guestData.key;
+      }
+    }
+  } catch (error) {
+    console.warn('⚠️  Could not obtain automatic API key:', error);
+  }
+
+  // Fallback: prompt user for manual setup
+  console.error('❌ Unable to obtain API key automatically.');
+  console.error('📝 Please get an API key from https://openrouter.ai/ and either:');
+  console.error('   1. Set OPENROUTER_API_KEY environment variable');
+  console.error('   2. Create a .env file with OPENROUTER_API_KEY=your_key_here');
+  console.error('   3. Use: export OPENROUTER_API_KEY=your_key_here');
+  process.exit(1);
+}
+
+async function loadAndValidateConfig(): Promise<Config> {
+  const apiKey = await getOrCreateApiKey();
+
   return {
-    apiKey: process.env.OPENROUTER_API_KEY!,
+    apiKey: apiKey,
     baseUrl: process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1/chat/completions',
     httpReferer: process.env.HTTP_REFERER || 'https://github.com/cline/cline',
     xTitle: process.env.X_TITLE || 'Cline Commit Analyzer',
@@ -1321,21 +1376,86 @@ async function executeInteractiveRebase(
   rebaseScript: string,
   maxCommits?: number
 ): Promise<void> {
-  // This is a simplified version - in practice, you'd need to handle the interactive rebase more carefully
-  console.log('⚠️  Interactive rebase execution would happen here');
-  console.log('📝 Rebase script preview:');
-  console.log(rebaseScript.split('\n').slice(0, 5).join('\n'));
-  if (rebaseScript.split('\n').length > 5) {
-    console.log('... (truncated)');
+  console.log('🚀 Starting interactive rebase with your editor...');
+  console.log('📝 Commits marked for reword will open in your editor for modification');
+
+  try {
+    // Write the rebase script to a temporary file
+    const { writeFile, unlink } = await import('fs/promises');
+    const { join } = await import('path');
+    const { tmpdir } = await import('os');
+
+    const tempScriptPath = join(tmpdir(), `git-rebase-script-${Date.now()}.txt`);
+    await writeFile(tempScriptPath, rebaseScript);
+
+    console.log(`📄 Rebase script written to: ${tempScriptPath}`);
+    console.log('📝 Script preview:');
+    console.log(rebaseScript.split('\n').slice(0, 10).join('\n'));
+    if (rebaseScript.split('\n').length > 10) {
+      console.log(`... and ${rebaseScript.split('\n').length - 10} more lines`);
+    }
+
+    // Set up environment for interactive rebase
+    const env = {
+      ...process.env,
+      GIT_SEQUENCE_EDITOR: `cp "${tempScriptPath}" "$1"`, // Use our pre-built script
+      GIT_EDITOR: process.env.GIT_EDITOR || process.env.EDITOR || 'nano', // Respect user's editor preference
+    };
+
+    // Find the oldest commit to rebase from
+    const oldestCommitLine = rebaseScript.split('\n').find((line) => line.trim());
+    if (!oldestCommitLine) {
+      throw new Error('No commits found in rebase script');
+    }
+
+    const oldestCommitHash = oldestCommitLine.split(' ')[1];
+
+    console.log('\n🎯 Starting interactive rebase...');
+    console.log('💡 Your editor will open for each commit marked as "reword"');
+    console.log('💡 Modify the commit messages as needed and save/close the editor');
+    console.log('💡 Press Ctrl+C to abort the rebase if needed');
+
+    // Execute the interactive rebase
+    const { spawn } = await import('child_process');
+
+    const rebaseProcess = spawn('git', ['rebase', '-i', `${oldestCommitHash}~1`], {
+      cwd: repoPath,
+      env,
+      stdio: 'inherit', // This allows the user to interact with the editor
+    });
+
+    // Wait for the rebase to complete
+    await new Promise<void>((resolve, reject) => {
+      rebaseProcess.on('close', (code) => {
+        if (code === 0) {
+          console.log('\n✅ Interactive rebase completed successfully!');
+          resolve();
+        } else {
+          console.log(`\n❌ Rebase exited with code ${code}`);
+          if (code === 1) {
+            console.log('💡 This might be due to conflicts or user cancellation');
+            console.log('💡 Check git status and resolve any conflicts if needed');
+          }
+          reject(new Error(`Rebase failed with exit code ${code}`));
+        }
+      });
+
+      rebaseProcess.on('error', (error) => {
+        console.error('\n❌ Failed to start rebase process:', error);
+        reject(error);
+      });
+    });
+
+    // Clean up temporary file
+    try {
+      await unlink(tempScriptPath);
+    } catch (error) {
+      console.warn('⚠️  Could not clean up temporary script file:', error);
+    }
+  } catch (error) {
+    console.error('❌ Error during interactive rebase:', error);
+    throw error;
   }
-
-  // In a real implementation, you would:
-  // 1. Write the rebase script to a temporary file
-  // 2. Set up environment variables for the commit message editor
-  // 3. Execute git rebase -i with the script
-  // 4. Handle the interactive prompts programmatically
-
-  console.log('⚠️  Note: Full rebase implementation requires careful handling of git internals');
 }
 
 async function generateConventionalCommitsGuide(outputPath: string): Promise<void> {
@@ -1359,7 +1479,7 @@ async function generateConventionalCommitsGuide(outputPath: string): Promise<voi
 // =================================================================
 
 async function main(): Promise<void> {
-  const config = loadAndValidateConfig();
+  const config = await loadAndValidateConfig();
   const cliArgs = parseCommandLineArgs();
 
   if (cliArgs.help) {

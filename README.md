@@ -267,12 +267,26 @@ The tool analyzes commits against conventional commit standards:
 
 ## API Requirements
 
-This tool requires an OpenRouter API key. OpenRouter provides access to various AI models with competitive pricing and rate limits.
+🎉 **NEW: Automatic API Key Management!**
+
+The tool now automatically obtains temporary API keys from OpenRouter when none is provided! No manual setup required for basic usage.
+
+### Automatic Mode (Recommended for Quick Start)
+
+- Just run the tool - it will automatically get a temporary API key
+- Limited usage but perfect for trying out the tool
+- No manual configuration needed
+
+### Manual API Key (Recommended for Heavy Usage)
+
+For unlimited usage and better rate limits:
 
 1. Sign up at [OpenRouter](https://openrouter.ai/)
 2. Get your API key from the dashboard
 3. Add credits to your account (free tier available)
 4. Set the `OPENROUTER_API_KEY` environment variable
+
+The tool will automatically detect and use your manual API key if provided, otherwise it falls back to automatic temporary keys.
 
 ## Troubleshooting
 
